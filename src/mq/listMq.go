@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"path"
 
 	log "qiniupkg.com/x/log.v7"
 
@@ -18,9 +19,11 @@ import (
 	"strconv"
 	"strings"
 
+	"bytes"
 	"fmt"
 	"qbox.us/cc/table"
 	pfdType "qbox.us/pfd/api/types"
+	"github.com/qiniu/xlog.v1"
 )
 
 type recordHeader struct {
@@ -158,23 +161,43 @@ func Delete(m *Message) string {
 	return msg
 }
 
+
+func write(msg string) {
+	fname := path.Join("/disk12/listMq", "fh_error")
+	f, err := os.OpenFile(fname, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0744)
+	if err != nil {
+		log.Fatalln("os.OpenFile: ", err)
+	}
+	_, err = f.WriteString(msg+"\n")
+	if err != nil {
+		log.Fatalln("f.WriteString", err)
+	}
+	f.Close()
+}
+
 func filterMsg2(wg *sync.WaitGroup, in, out chan []byte) {
 	defer wg.Done()
 	for msg := range in {
+		xl := xlog.NewDummy()
 
 		//读取 parse rsedit的消息
 		m, err := ParseMessage("", string(msg))
 		if err != nil {
 			log.Fatal(err)
 		}
-		//bddelete过滤
-		//op过滤
-		if !hasString(deleteFileOps, m.Op) {
-			continue
+		////bddelete过滤
+		////op过滤
+		//
+		//if !hasString(deleteFileOps, m.Op) {
+		//	continue
+		//}
+		////bddelete消息内容
+		//deleteMsg := Delete(m)
+		if m.Op == "delete" && len(m.Fh) == 0 {
+			xl.Warn("ParseMessage len(m.Fh)==0 op delete")
+			write(string(msg))
 		}
-		//bddelete消息内容
-		deleteMsg := Delete(m)
-		out <- []byte(deleteMsg)
+		out <- []byte(msg)
 	}
 }
 
@@ -211,31 +234,38 @@ func main() {
 
 	// find real start offset
 	var tmp = make([]byte, 1024*512)
-	fmt.Println("tmp", 1024*512)
+	tmpLen := int64(1024 * 512)
+	fmt.Println("tmp", tmpLen)
 	_, err = io.ReadFull(r, tmp)
 	if err != nil {
 		log.Fatal(err)
 	}
-	var realStartOffset, i int64
+	var realStartOffset int64
+	var i int64
+	bufr := bytes.NewReader(tmp)
 
-	//猜测rsedit消息开始的正确位置
-	for ; i < 524228; i++ {
+	for ; i < tmpLen; i++ {
 		fmt.Println("i: ", i)
-		//parse header msgLen , parseMsg
-		msgLen := tmp[i : i+2]
-		len, err := strconv.ParseInt(string(msgLen),10, 64)
+		var h recordHeader
+		bufr.Seek(i, 0)
+		err = binary.Read(bufr, binary.LittleEndian, &h)
 		if err != nil {
-			fmt.Println("err: ", err)
+			fmt.Println("binary.Read, err :", err)
 		}
-		fmt.Println("len of msg: ", len)
-		_, err = ParseMessage("", string(tmp[i+2:i+2+len]))
+		if h.MsgLen > uint16(tmpLen-i-8) {
+			continue
+		}
+		if h.Tag != 0x0a {
+			continue
+		}
+		//bufr
+		_, err = ParseMessage("", string(tmp[i+8:i+8+int64(h.MsgLen)]))
 		fmt.Println("err:", err)
 		if err == nil {
-			realStartOffset = *startOffset + i - 8
+			realStartOffset = *startOffset + i
 			log.Println("real start offset", realStartOffset)
 			break
 		}
-
 	}
 
 	r = &cc.Reader{f, realStartOffset}
